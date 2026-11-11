@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Qingniao.Core\Qingniao.Core.csproj" />
+    <ProjectReference Include="..\Qingniao.Mesh\Qingniao.Mesh.csproj" />
+    <ProjectReference Include="..\Qingniao.LinkManager\Qingniao.LinkManager.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
