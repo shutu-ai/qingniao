@@ -23,6 +23,14 @@ public class CheckRegistryTests
     }
 
     [Fact]
+    public void CreateAll_NatEntry_IsRealCheckNotPlaceholder()
+    {
+        var nat = CheckRegistry.CreateAll().Single(c => c.Name == "nat");
+
+        Assert.IsType<NatTypeCheck>(nat);
+    }
+
+    [Fact]
     public async Task CreateAll_WithConfig_PlaceholdersRunAsUnknown()
     {
         var config = new Qingniao.Core.MeshConfig
@@ -36,10 +44,10 @@ public class CheckRegistryTests
 
         Assert.Equal(5, checks.Count);
 
-        // Task 7 起 ipv6 已换为真实实现(机器相关,不在注册表测试里跑),
+        // Task 7 起 ipv6、Task 9 起 nat 已换为真实实现(机器/网络相关,不在注册表测试里跑),
         // 其余占位仍应返回 Unknown("尚未实现")。
-        var placeholders = checks.Where(c => c.Name != "ipv6").ToArray();
-        Assert.Equal(4, placeholders.Length);
+        var placeholders = checks.Where(c => c.Name != "ipv6" && c.Name != "nat").ToArray();
+        Assert.Equal(3, placeholders.Length);
         foreach (var check in placeholders)
         {
             var result = await check.RunAsync(CancellationToken.None);

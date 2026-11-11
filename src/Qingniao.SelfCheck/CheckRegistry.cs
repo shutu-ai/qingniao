@@ -13,7 +13,7 @@ public static class CheckRegistry
     public static IReadOnlyList<IEnvironmentCheck> CreateAll(MeshConfig? config = null) =>
     [
         new Ipv6Check(),
-        new UnknownCheck("nat"),
+        new NatTypeCheck(servers: config?.StunServers),
         new UnknownCheck("gpu-encoder"),
         new UnknownCheck("vpn-reachability"),
         new UnknownCheck("bandwidth"),
