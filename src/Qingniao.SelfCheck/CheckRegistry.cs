@@ -14,7 +14,7 @@ public static class CheckRegistry
     [
         new Ipv6Check(),
         new NatTypeCheck(servers: config?.StunServers),
-        new UnknownCheck("gpu-encoder"),
+        new GpuEncoderCheck(), // 注册表本地探测,不消费 config
         new UnknownCheck("vpn-reachability"),
         new UnknownCheck("bandwidth"),
     ];

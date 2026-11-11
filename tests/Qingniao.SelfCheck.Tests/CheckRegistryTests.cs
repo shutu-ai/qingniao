@@ -31,6 +31,14 @@ public class CheckRegistryTests
     }
 
     [Fact]
+    public void CreateAll_GpuEncoderEntry_IsRealCheckNotPlaceholder()
+    {
+        var gpuEncoder = CheckRegistry.CreateAll().Single(c => c.Name == "gpu-encoder");
+
+        Assert.IsType<GpuEncoderCheck>(gpuEncoder);
+    }
+
+    [Fact]
     public async Task CreateAll_WithConfig_PlaceholdersRunAsUnknown()
     {
         var config = new Qingniao.Core.MeshConfig
@@ -44,10 +52,12 @@ public class CheckRegistryTests
 
         Assert.Equal(5, checks.Count);
 
-        // Task 7 起 ipv6、Task 9 起 nat 已换为真实实现(机器/网络相关,不在注册表测试里跑),
-        // 其余占位仍应返回 Unknown("尚未实现")。
-        var placeholders = checks.Where(c => c.Name != "ipv6" && c.Name != "nat").ToArray();
-        Assert.Equal(3, placeholders.Length);
+        // Task 7 起 ipv6、Task 9 起 nat、Task 10 起 gpu-encoder 已换为真实实现
+        // (机器/网络相关,不在注册表测试里跑),其余占位仍应返回 Unknown("尚未实现")。
+        var placeholders = checks
+            .Where(c => c.Name != "ipv6" && c.Name != "nat" && c.Name != "gpu-encoder")
+            .ToArray();
+        Assert.Equal(2, placeholders.Length);
         foreach (var check in placeholders)
         {
             var result = await check.RunAsync(CancellationToken.None);
