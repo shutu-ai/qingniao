@@ -1,6 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Qingniao.SelfCheck.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Qingniao.Core\Qingniao.Core.csproj" />
     <ProjectReference Include="..\Qingniao.LinkManager\Qingniao.LinkManager.csproj" />
   </ItemGroup>
