@@ -1,3 +1,5 @@
+using Qingniao.SelfCheck.Checks;
+
 namespace Qingniao.SelfCheck.Tests;
 
 public class CheckRegistryTests
@@ -13,6 +15,14 @@ public class CheckRegistryTests
     }
 
     [Fact]
+    public void CreateAll_Ipv6Entry_IsRealCheckNotPlaceholder()
+    {
+        var ipv6 = CheckRegistry.CreateAll().Single(c => c.Name == "ipv6");
+
+        Assert.IsType<Ipv6Check>(ipv6);
+    }
+
+    [Fact]
     public async Task CreateAll_WithConfig_PlaceholdersRunAsUnknown()
     {
         var config = new Qingniao.Core.MeshConfig
@@ -25,7 +35,12 @@ public class CheckRegistryTests
         var checks = CheckRegistry.CreateAll(config);
 
         Assert.Equal(5, checks.Count);
-        foreach (var check in checks)
+
+        // Task 7 起 ipv6 已换为真实实现(机器相关,不在注册表测试里跑),
+        // 其余占位仍应返回 Unknown("尚未实现")。
+        var placeholders = checks.Where(c => c.Name != "ipv6").ToArray();
+        Assert.Equal(4, placeholders.Length);
+        foreach (var check in placeholders)
         {
             var result = await check.RunAsync(CancellationToken.None);
             Assert.Equal(CheckStatus.Unknown, result.Status);

@@ -1,4 +1,5 @@
 using Qingniao.Core;
+using Qingniao.SelfCheck.Checks;
 
 namespace Qingniao.SelfCheck;
 
@@ -11,7 +12,7 @@ public static class CheckRegistry
     /// </param>
     public static IReadOnlyList<IEnvironmentCheck> CreateAll(MeshConfig? config = null) =>
     [
-        new UnknownCheck("ipv6"),
+        new Ipv6Check(),
         new UnknownCheck("nat"),
         new UnknownCheck("gpu-encoder"),
         new UnknownCheck("vpn-reachability"),
@@ -19,7 +20,7 @@ public static class CheckRegistry
     ];
 }
 
-/// <summary>占位检查:返回 Unknown("尚未实现")。Task 7/8/9/10/11/14 以真实实现逐项替换。</summary>
+/// <summary>占位检查:返回 Unknown("尚未实现")。Task 8/9/10/11/14 以真实实现逐项替换。</summary>
 internal sealed class UnknownCheck(string name) : IEnvironmentCheck
 {
     public string Name => name;
