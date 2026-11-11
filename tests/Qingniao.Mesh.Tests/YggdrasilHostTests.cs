@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading; // HostFixture 清理重试用 Thread.Sleep
 using Qingniao.Core;
 using Qingniao.Mesh;
 
@@ -16,6 +17,9 @@ public class YggdrasilHostTests
 {
     private const string FakeAddress = "200:abcd:ef01:2345:6789:abcd:ef01:2345";
     private const string FakeKey = "pubkey-fake0123456789";
+
+    /// <summary>长驻假子进程的进程名(不带扩展名),供泄漏检查。</summary>
+    private const string LongLivedExeName = "qn-sleeper";
 
     // ---------------------------------------------------------------- Live
 
@@ -112,15 +116,35 @@ public class YggdrasilHostTests
     }
 
     [Fact]
+    public async Task StartAsync_AdminNeverReady_KillsChildAndUnblocksRestart()
+    {
+        // 长驻假子进程 + 静默 admin 端口(端口被占、永不响应):预算耗尽必须抛出,
+        // 且存活子进程必须被清理——否则同一实例被残留 _process 卡死,永远无法再次启动
+        using var fixture = new HostFixture(withAdminServer: false, childKind: ChildKind.LongLived);
+        var host = fixture.CreateHost(startBudgetMs: 2000, pollIntervalMs: 200);
+
+        var first = await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync());
+        Assert.Contains("未就绪", first.Message);
+        Assert.Null(host.CurrentProcessId); // 失败后不留活子进程的登记
+        await fixture.AssertNoLeakedChildAsync();
+
+        var second = await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync());
+        Assert.DoesNotContain("已启动", second.Message); // 修复前:此处置 "已启动或正在启动" 失败
+        Assert.Contains("未就绪", second.Message); // 必须是预算耗尽,而非拒绝启动
+        await host.DisposeAsync();
+    }
+
+    [Fact]
     public async Task StartAsync_AdminNeverReady_ThrowsWhenBudgetExhaustedWithLastError()
     {
-        // admin 端口上没有任何服务:每次 GetSelf 都连接被拒;用短预算(真实时间)验证耗尽路径
+        // admin 端口被静默假服务器占用(收请求、不回包):每次 GetSelf 超时;用短预算(真实时间)验证耗尽路径
         using var fixture = new HostFixture(withAdminServer: false);
         var host = fixture.CreateHost(startBudgetMs: 2000, pollIntervalMs: 200);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync());
 
         Assert.Contains("admin", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("未就绪", exception.Message);
     }
 
     [Fact]
@@ -281,29 +305,39 @@ public class YggdrasilHostTests
         }
     }
 
+    /// <summary>假子进程种类:立即退出的 ping 副本,或忽略参数的长驻编译进程。</summary>
+    private enum ChildKind
+    {
+        Exe,
+        LongLived,
+    }
+
     /// <summary>每个测试的隔离环境:临时目录(放假 exe)+ 可选的进程内假 admin 服务器。</summary>
     private sealed class HostFixture : IDisposable
     {
         private readonly string _dir;
-        private readonly FakeAdminServer? _server;
+        private readonly FakeAdminServer _server;
 
         public MeshConfig Config { get; }
         public string ConfPath { get; }
-        public int AdminRequestCount => _server?.AdminRequestCount ?? 0;
+        public int AdminRequestCount => _server.AdminRequestCount;
 
-        public HostFixture(bool withAdminServer)
+        /// <param name="withAdminServer">
+        /// true:应答固定 getSelf 成功;false:静默占位——端口被真实节点占用且永不响应的确定性替身(收请求、不回包)。
+        /// </param>
+        public HostFixture(bool withAdminServer, ChildKind childKind = ChildKind.Exe)
         {
             _dir = Directory.CreateTempSubdirectory("qingniao-host-test-").FullName;
-            var exePath = Path.Combine(_dir, "ping.exe");
-            File.Copy(Path.Combine(Environment.SystemDirectory, "ping.exe"), exePath);
+            var exePath = childKind == ChildKind.LongLived ? CompileLongLivedChild(_dir) : CopyPing(_dir);
             ConfPath = Path.Combine(_dir, "qingniao-ygg.conf");
 
-            _server = withAdminServer ? FakeAdminServer.Start(_ =>
-                $"{{\"status\":\"success\",\"response\":{{\"address\":\"{FakeAddress}\",\"key\":\"{FakeKey}\"}}}}") : null;
+            _server = FakeAdminServer.Start(_ => withAdminServer
+                ? $"{{\"status\":\"success\",\"response\":{{\"address\":\"{FakeAddress}\",\"key\":\"{FakeKey}\"}}}}"
+                : null);
 
             Config = new MeshConfig
             {
-                AdminPort = _server?.Port ?? 13372,
+                AdminPort = _server.Port,
                 YggdrasilExePath = exePath,
             };
         }
@@ -313,8 +347,76 @@ public class YggdrasilHostTests
 
         public void Dispose()
         {
-            _server?.Dispose();
-            try { Directory.Delete(_dir, recursive: true); } catch (IOException) { } // 文件被占用时留给系统清理
+            _server.Dispose();
+            // 尽力而为:AV 扫描/进程句柄释放竞态可能短暂锁住新编译的 exe;清理失败交给系统临时目录回收,
+            // 绝不能在 Dispose 中抛出(会掩盖测试本体异常)
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    Directory.Delete(_dir, recursive: true);
+                    return;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                Thread.Sleep(200);
+            }
+        }
+
+        /// <summary>断言本夹具目录下的长驻子进程已全部退出(按镜像路径过滤,不受同名单独孤儿影响)。</summary>
+        public async Task AssertNoLeakedChildAsync()
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (true)
+            {
+                var mine = 0;
+                foreach (var process in Process.GetProcessesByName(LongLivedExeName))
+                {
+                    try
+                    {
+                        if (process.MainModule?.FileName?.StartsWith(_dir, StringComparison.OrdinalIgnoreCase) == true)
+                            mine++;
+                    }
+                    catch (Exception)
+                    {
+                        // 镜像路径不可读(已退出竞态/权限)——不计入本夹具泄漏
+                    }
+                    process.Dispose();
+                }
+                if (mine == 0) return;
+                if (DateTime.UtcNow > deadline)
+                    throw new TimeoutException($"疑似泄漏 {mine} 个 {LongLivedExeName} 进程");
+                await Task.Delay(100);
+            }
+        }
+
+        private static string CopyPing(string dir)
+        {
+            var exePath = Path.Combine(dir, "ping.exe");
+            File.Copy(Path.Combine(Environment.SystemDirectory, "ping.exe"), exePath);
+            return exePath;
+        }
+
+        /// <summary>用 .NET Framework 自带的 csc 编译一个忽略参数、睡眠 120s 的控制台 exe(长驻假子进程)。</summary>
+        private static string CompileLongLivedChild(string dir)
+        {
+            var csc = Path.GetFullPath(Path.Combine(
+                Environment.SystemDirectory, "..", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"));
+            Assert.True(File.Exists(csc), $"未找到 Framework csc:{csc}");
+            var sourcePath = Path.Combine(dir, LongLivedExeName + ".cs");
+            var exePath = Path.Combine(dir, LongLivedExeName + ".exe");
+            File.WriteAllText(sourcePath, "using System.Threading;\nstatic class P\n{\n    static void Main() { Thread.Sleep(120000); }\n}\n"); // csc 4.8 仅支持 C# 5
+            using var compiler = Process.Start(new ProcessStartInfo
+            {
+                FileName = csc,
+                ArgumentList = { "/nologo", "/t:exe", $"/out:{exePath}", sourcePath },
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
+            Assert.NotNull(compiler);
+            Assert.True(compiler!.WaitForExit(10000) && compiler.ExitCode == 0, $"长驻子进程编译失败:{csc}");
+            compiler.Dispose();
+            return exePath;
         }
     }
 
@@ -332,21 +434,21 @@ public class YggdrasilHostTests
 
         private int _requestCount;
 
-        private FakeAdminServer(TcpListener listener, Func<string, string> handler)
+        private FakeAdminServer(TcpListener listener, Func<string, string?> handler)
         {
             _listener = listener;
             Port = ((IPEndPoint)listener.LocalEndpoint!).Port;
             _acceptLoop = AcceptLoopAsync(handler);
         }
 
-        public static FakeAdminServer Start(Func<string, string> handler)
+        public static FakeAdminServer Start(Func<string, string?> handler)
         {
             var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start();
             return new FakeAdminServer(listener, handler);
         }
 
-        private async Task AcceptLoopAsync(Func<string, string> handler)
+        private async Task AcceptLoopAsync(Func<string, string?> handler)
         {
             try
             {
@@ -367,7 +469,7 @@ public class YggdrasilHostTests
             catch (ObjectDisposedException) { }
         }
 
-        private async Task ServeAsync(TcpClient client, Func<string, string> handler)
+        private async Task ServeAsync(TcpClient client, Func<string, string?> handler)
         {
             var stream = client.GetStream(); // 连接生命周期归 TcpClient,此处不释放
             using var reader = new StreamReader(stream, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
@@ -375,8 +477,10 @@ public class YggdrasilHostTests
             if (line is null) return;
             Interlocked.Increment(ref _requestCount);
             LastRequestLine = line;
+            var response = handler(line);
+            if (response is null) return; // 静默占位:不回包、不断开,客户端只能超时
             await using var writer = new StreamWriter(stream, new UTF8Encoding(false), bufferSize: 1024, leaveOpen: true) { NewLine = "\n", AutoFlush = true };
-            await writer.WriteLineAsync(handler(line).AsMemory(), _cts.Token);
+            await writer.WriteLineAsync(response.AsMemory(), _cts.Token);
         }
 
         public void Dispose()

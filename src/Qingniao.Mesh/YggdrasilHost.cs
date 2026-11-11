@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using Qingniao.Core;
 
@@ -109,7 +110,27 @@ public sealed class YggdrasilHost : IAsyncDisposable
         }
         catch
         {
-            lock (_gate) { _starting = false; }
+            // 启动失败(含轮询预算耗尽):同步清理登记状态,并杀掉可能仍在运行的子进程,
+            // 否则泄漏的存活子进程会让同一实例永远无法再次 StartAsync
+            Process? process;
+            Task? drain;
+            lock (_gate)
+            {
+                process = _process;
+                drain = _stdoutDrain;
+                _process = null;
+                _stdoutDrain = null;
+                CurrentProcessId = null;
+                SelfAddress = null;
+                SelfKey = null;
+                _starting = false;
+            }
+            if (process is not null)
+            {
+                await KillProcessAsync(process, timeoutMs: 3000);
+                await AwaitStdoutDrainAsync(drain);
+                process.Dispose();
+            }
             throw;
         }
     }
@@ -249,16 +270,18 @@ public sealed class YggdrasilHost : IAsyncDisposable
         return process.Id;
     }
 
-    /// <summary>子进程意外退出:清空自省属性、通知订阅者,再由看门狗按退避调度重启。</summary>
+    /// <summary>子进程意外退出:清空自省属性、通知订阅者、回收句柄,再由看门狗按退避调度重启。</summary>
     private void OnProcessExited(object? sender, EventArgs e)
     {
         Process? process;
+        Task? drain;
         lock (_gate)
         {
             process = _process;
             if (process is null || _stopping)
                 return; // 计划内 Stop 已接管状态,此处无事可做
             _process = null;
+            drain = _stdoutDrain;
             _stdoutDrain = null;
             CurrentProcessId = null;
             SelfAddress = null;
@@ -274,6 +297,9 @@ public sealed class YggdrasilHost : IAsyncDisposable
         {
             // 订阅者异常就地隔离:事件契约是单向通知,看门狗必须继续运行(守护进程阶段接入日志后改为记录)
         }
+
+        _ = AwaitStdoutDrainAsync(drain); // 排空任务自带 3s 上限与异常收口,不阻塞看门狗
+        process.Dispose(); // 退出后立即回收句柄,避免依赖终结器
 
         lock (_gate)
         {
@@ -344,6 +370,10 @@ public sealed class YggdrasilHost : IAsyncDisposable
         catch (InvalidOperationException)
         {
             // 进程恰好已自行退出,无需再杀
+        }
+        catch (Win32Exception)
+        {
+            // 访问被拒等系统级拒绝:不冒泡打断 StopAsync/清理路径,等待与 Dispose 兜底
         }
 
         using var timeoutCts = new CancellationTokenSource(timeoutMs);
