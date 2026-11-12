@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Qingniao.Core\Qingniao.Core.csproj" />
+    <ProjectReference Include="..\Qingniao.Mesh\Qingniao.Mesh.csproj" />
   </ItemGroup>
 
   <ItemGroup>
