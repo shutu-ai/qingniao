@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Qingniao.Core;
 using Qingniao.SelfCheck;
 
 try
@@ -14,6 +15,7 @@ catch
 
 var json = false;
 string? only = null;
+var configPath = "configs/sample.json";
 for (var i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -30,13 +32,35 @@ for (var i = 0; i < args.Length; i++)
 
             only = args[++i];
             break;
+        case "--config":
+            if (i + 1 >= args.Length)
+            {
+                Console.Error.WriteLine("错误: --config 需要一个路径参数");
+                return 2;
+            }
+
+            configPath = args[++i];
+            break;
         default:
-            Console.Error.WriteLine($"错误: 无法识别的参数 \"{args[i]}\"(支持 --json 与 --only <name>)");
+            Console.Error.WriteLine(
+                $"错误: 无法识别的参数 \"{args[i]}\"(支持 --json、--only <name> 与 --config <path>)");
             return 2;
     }
 }
 
-var checks = CheckRegistry.CreateAll();
+// 缺文件回落默认配置;文件存在但非法时报错退出(R16)
+MeshConfig config;
+try
+{
+    config = ConfigStore.LoadOrDefault(configPath);
+}
+catch (ConfigException ex)
+{
+    Console.Error.WriteLine($"错误: {ex.Message}");
+    return 2;
+}
+
+var checks = CheckRegistry.CreateAll(config);
 if (only is not null)
 {
     var match = checks.FirstOrDefault(c =>
