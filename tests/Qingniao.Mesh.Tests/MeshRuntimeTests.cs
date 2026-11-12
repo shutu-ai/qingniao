@@ -86,6 +86,34 @@ public class MeshRuntimeTests
     }
 
     [Fact]
+    public async Task StartAsync_PeerFound_OwnNodeName_IsDroppedBeforeOrchestrator()
+    {
+        // I1:本机自己的 mDNS 通告会回流,不过滤会 addPeer 自己(yggdrasil ErrLinkToSelf 僵尸连接)。
+        // 按节点名在接线处丢弃,OrdinalIgnoreCase(Windows 主机名不区分大小写)。
+        MeshRuntimeFixture fixture = new();
+        using CancellationTokenSource cts = new();
+        TaskCompletionSource<PeerCandidate> arrived =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Orchestrator.OnCandidate = candidate => arrived.TrySetResult(candidate);
+
+        await fixture.Runtime.StartAsync(cts.Token);
+
+        fixture.Discovery.Fire(
+            new PeerDiscovered(MeshRuntimeFixture.OwnNodeName, IPAddress.Parse("192.168.1.10"), MeshPort));
+        fixture.Discovery.Fire(
+            new PeerDiscovered(MeshRuntimeFixture.OwnNodeName.ToUpperInvariant(), IPAddress.Parse("192.168.1.11"), MeshPort));
+        Assert.Empty(fixture.Orchestrator.Candidates);
+
+        // 他机发现仍流转(证明管线活着,且此前自身候选未混入)
+        fixture.Discovery.Fire(
+            new PeerDiscovered("machine-b", IPAddress.Parse("192.168.1.20"), MeshPort));
+        await arrived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        PeerCandidate candidate = Assert.Single(fixture.Orchestrator.Candidates);
+        Assert.Equal(IPAddress.Parse("192.168.1.20"), candidate.Address);
+    }
+
+    [Fact]
     public async Task RunVpnScanCycleAsync_OnlyOpenResultsReachOrchestratorAsVpnCandidates()
     {
         MeshRuntimeFixture fixture = new(["10.66.0.0/24"]);
@@ -134,6 +162,8 @@ public class MeshRuntimeTests
     /// <summary>组装一套全假件运行时;每测试独立实例,可注入配置的 VPN 网段。</summary>
     private sealed class MeshRuntimeFixture
     {
+        public const string OwnNodeName = "machine-a";
+
         public FakeHost Host { get; } = new();
         public FakeAdvertiser Advertiser { get; } = new();
         public FakeDiscovery Discovery { get; } = new();
@@ -146,6 +176,7 @@ public class MeshRuntimeTests
         {
             Runtime = new MeshRuntime(
                 new MeshConfig { MeshPort = MeshPort, VpnCidrs = vpnCidrs ?? [] },
+                OwnNodeName,
                 Host,
                 Advertiser,
                 Discovery,

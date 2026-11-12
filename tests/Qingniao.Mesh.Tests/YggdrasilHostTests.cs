@@ -271,6 +271,27 @@ public class YggdrasilHostTests
             doc.RootElement.GetProperty("arguments").GetProperty("uri").GetString());
     }
 
+    [Fact]
+    public async Task ChildPrintsThenExitsNonZero_StdoutTailSurfacedOnExitedEvent()
+    {
+        // I5:崩溃子进程自身的错误文本(配置解析、wintun 加载、端口冲突)必须能到达操作者——
+        // 假子进程打印一行后以非零码退出,Exited 事件参数携带单行尾迹,LastStdoutTail 同步可取
+        using var fixture = new HostFixture(withAdminServer: false, childKind: ChildKind.PrintingExit);
+        var host = fixture.CreateHost(startBudgetMs: 2000, pollIntervalMs: 200);
+        var exited = new TaskCompletionSource<HostExitedEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Exited += (_, args) => exited.TrySetResult(args);
+
+        // admin 永不就绪 → StartAsync 预算耗尽抛出;期间子进程已自行退出并触发 Exited
+        await Assert.ThrowsAsync<InvalidOperationException>(() => host.StartAsync());
+        var args = await AwaitOrTimeout(exited.Task, TimeSpan.FromSeconds(10));
+
+        Assert.NotNull(args.StdoutTail);
+        Assert.Contains("qn-fake-ygg-tail-probe stdout line", args.StdoutTail);
+        Assert.DoesNotContain("\n", args.StdoutTail); // 尾迹必须单行化
+        Assert.Equal(args.StdoutTail, host.LastStdoutTail);
+        await host.DisposeAsync();
+    }
+
     // ------------------------------------------------------------- helpers
 
     /// <summary>Live 用:定位仓库根下的真实 yggdrasil(测试 cwd 在 bin 目录,需向上回溯)。</summary>
@@ -313,11 +334,12 @@ public class YggdrasilHostTests
         }
     }
 
-    /// <summary>假子进程种类:立即退出的 ping 副本,或忽略参数的长驻编译进程。</summary>
+    /// <summary>假子进程种类:立即退出的 ping 副本、忽略参数的长驻编译进程,或打印后非零退出的编译进程。</summary>
     private enum ChildKind
     {
         Exe,
         LongLived,
+        PrintingExit,
     }
 
     /// <summary>每个测试的隔离环境:临时目录(放假 exe)+ 可选的进程内假 admin 服务器。</summary>
@@ -336,7 +358,12 @@ public class YggdrasilHostTests
         public HostFixture(bool withAdminServer, ChildKind childKind = ChildKind.Exe)
         {
             _dir = Directory.CreateTempSubdirectory("qingniao-host-test-").FullName;
-            var exePath = childKind == ChildKind.LongLived ? CompileLongLivedChild(_dir) : CopyPing(_dir);
+            var exePath = childKind switch
+            {
+                ChildKind.LongLived => CompileLongLivedChild(_dir),
+                ChildKind.PrintingExit => CompilePrintingExitChild(_dir),
+                _ => CopyPing(_dir),
+            };
             ConfPath = Path.Combine(_dir, "qingniao-ygg.conf");
 
             // 真实 yggdrasil 应答为多行 pretty JSON(SetIndent("", "  ")),假服务器同形(R21b)
@@ -415,14 +442,34 @@ public class YggdrasilHostTests
         }
 
         /// <summary>用 .NET Framework 自带的 csc 编译一个忽略参数、睡眠 120s 的控制台 exe(长驻假子进程)。</summary>
-        private static string CompileLongLivedChild(string dir)
+        private static string CompileLongLivedChild(string dir) => CompileChild(
+            dir,
+            LongLivedExeName,
+            "using System.Threading;\nstatic class P\n{\n    static void Main() { Thread.Sleep(120000); }\n}\n");
+
+        /// <summary>编译一个打印一行后以非零码退出的控制台 exe(I5:验证 stdout 尾迹浮现)。</summary>
+        private static string CompilePrintingExitChild(string dir) => CompileChild(
+            dir,
+            "qn-tail-probe",
+            "using System;\n"
+            + "static class P\n"
+            + "{\n"
+            + "    static void Main()\n"
+            + "    {\n"
+            + "        Console.WriteLine(\"qn-fake-ygg-tail-probe stdout line\");\n"
+            + "        Environment.Exit(3);\n"
+            + "    }\n"
+            + "}\n");
+
+        /// <summary>csc 编译公共路径(csc 4.8 仅支持 C# 5;缺失时响亮失败)。</summary>
+        private static string CompileChild(string dir, string exeName, string source)
         {
             var csc = Path.GetFullPath(Path.Combine(
                 Environment.SystemDirectory, "..", "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"));
             Assert.True(File.Exists(csc), $"未找到 Framework csc:{csc}");
-            var sourcePath = Path.Combine(dir, LongLivedExeName + ".cs");
-            var exePath = Path.Combine(dir, LongLivedExeName + ".exe");
-            File.WriteAllText(sourcePath, "using System.Threading;\nstatic class P\n{\n    static void Main() { Thread.Sleep(120000); }\n}\n"); // csc 4.8 仅支持 C# 5
+            var sourcePath = Path.Combine(dir, exeName + ".cs");
+            var exePath = Path.Combine(dir, exeName + ".exe");
+            File.WriteAllText(sourcePath, source);
             using var compiler = Process.Start(new ProcessStartInfo
             {
                 FileName = csc,
@@ -431,7 +478,7 @@ public class YggdrasilHostTests
                 CreateNoWindow = true,
             });
             Assert.NotNull(compiler);
-            Assert.True(compiler!.WaitForExit(10000) && compiler.ExitCode == 0, $"长驻子进程编译失败:{csc}");
+            Assert.True(compiler!.WaitForExit(10000) && compiler.ExitCode == 0, $"假子进程 {exeName} 编译失败:{csc}");
             compiler.Dispose();
             return exePath;
         }

@@ -4,8 +4,12 @@ using Qingniao.Core;
 
 namespace Qingniao.Mesh;
 
-/// <summary>子进程退出参数(计划内 Stop 不触发 <see cref="YggdrasilHost.Exited"/> 事件)。</summary>
-public sealed record HostExitedEventArgs(int ProcessId);
+/// <summary>
+/// 子进程退出参数(计划内 Stop 不触发 <see cref="YggdrasilHost.Exited"/> 事件)。
+/// <paramref name="StdoutTail"/> 为子进程 stdout 末段的单行摘要(I5,≤2KB,换行折叠为空格),
+/// 未能捕获(排空超时/失败)时为 null。
+/// </summary>
+public sealed record HostExitedEventArgs(int ProcessId, string? StdoutTail = null);
 
 /// <summary>
 /// yggdrasil 托管的最小抽象(R15,Task 14):仅暴露 MeshRuntime 组装所需的启停成员,
@@ -40,7 +44,7 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
     private readonly int _pollIntervalMs;
 
     private Process? _process;
-    private Task? _stdoutDrain;
+    private Task<string>? _stdoutDrain;
     private ITimer? _restartTimer;
     private ITimer? _stabilityTimer;
     private CancellationTokenSource _lifetimeCts = new();
@@ -79,6 +83,12 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
 
     /// <summary>当前子进程号;未运行时为 null(供守护进程日志与测试使用)。</summary>
     public int? CurrentProcessId { get; private set; }
+
+    /// <summary>
+    /// 最近一次子进程 stdout 排空后的单行尾迹(I5:≤2KB,换行折叠;启动失败与意外退出时把
+    /// 子进程自身的错误文本带到操作者面前)。每次排空完成时更新;新一轮子进程排空完成前保留上一轮的尾迹。
+    /// </summary>
+    public string? LastStdoutTail { get; private set; }
 
     /// <summary>子进程意外退出时触发(计划内 Stop 不触发)。事件处理器内的异常会被隔离,不影响看门狗。</summary>
     public event EventHandler<HostExitedEventArgs>? Exited;
@@ -126,7 +136,7 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
             // 启动失败(含轮询预算耗尽):同步清理登记状态,并杀掉可能仍在运行的子进程,
             // 否则泄漏的存活子进程会让同一实例永远无法再次 StartAsync
             Process? process;
-            Task? drain;
+            Task<string>? drain;
             lock (_gate)
             {
                 process = _process;
@@ -141,7 +151,8 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
             if (process is not null)
             {
                 await KillProcessAsync(process, timeoutMs: 3000);
-                await AwaitStdoutDrainAsync(drain);
+                var tail = ToSingleLineTail(await AwaitStdoutTailAsync(drain));
+                lock (_gate) { LastStdoutTail = tail; }
                 process.Dispose();
             }
             throw;
@@ -160,7 +171,7 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
     public async Task StopAsync()
     {
         Process? process;
-        Task? drain;
+        Task<string>? drain;
         lock (_gate)
         {
             if (_stopping && _process is null) return; // 已完成停止
@@ -181,7 +192,8 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
         if (process is not null)
         {
             await KillProcessAsync(process, timeoutMs: 5000);
-            await AwaitStdoutDrainAsync(drain);
+            var tail = ToSingleLineTail(await AwaitStdoutTailAsync(drain));
+            lock (_gate) { LastStdoutTail = tail; }
             process.Dispose();
         }
     }
@@ -283,11 +295,12 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
         return process.Id;
     }
 
-    /// <summary>子进程意外退出:清空自省属性、通知订阅者、回收句柄,再由看门狗按退避调度重启。</summary>
+    /// <summary>子进程意外退出:清空自省属性,交由后台收尾(取尾迹 → 通知订阅者 → 回收句柄 → 看门狗调度重启)。</summary>
     private void OnProcessExited(object? sender, EventArgs e)
     {
         Process? process;
-        Task? drain;
+        Task<string>? drain;
+        int pid;
         lock (_gate)
         {
             process = _process;
@@ -296,23 +309,34 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
             _process = null;
             drain = _stdoutDrain;
             _stdoutDrain = null;
+            pid = CurrentProcessId ?? process.Id;
             CurrentProcessId = null;
             SelfAddress = null;
             SelfKey = null;
             DisposeTimersLocked(); // 稳定计时器随进程死亡一并作废
         }
 
+        _ = FinalizeUnexpectedExitAsync(process, drain, pid);
+    }
+
+    /// <summary>
+    /// 意外退出的后台收尾(I5):先等 stdout 排空(≤3s)取单行尾迹,再以携带尾迹的 Exited 通知订阅者
+    /// (守护进程日志因此能带上子进程自身的错误文本),随后回收句柄;最后由看门狗按退避调度重启。
+    /// </summary>
+    private async Task FinalizeUnexpectedExitAsync(Process process, Task<string>? drain, int pid)
+    {
+        var tail = ToSingleLineTail(await AwaitStdoutTailAsync(drain));
+        lock (_gate) { LastStdoutTail = tail; }
+        process.Dispose(); // 退出后立即回收句柄,避免依赖终结器
+
         try
         {
-            Exited?.Invoke(this, new HostExitedEventArgs(process.Id));
+            Exited?.Invoke(this, new HostExitedEventArgs(pid, tail));
         }
         catch
         {
             // 订阅者异常就地隔离:事件契约是单向通知,看门狗必须继续运行(守护进程阶段接入日志后改为记录)
         }
-
-        _ = AwaitStdoutDrainAsync(drain); // 排空任务自带 3s 上限与异常收口,不阻塞看门狗
-        process.Dispose(); // 退出后立即回收句柄,避免依赖终结器
 
         lock (_gate)
         {
@@ -397,17 +421,30 @@ public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
         catch (OperationCanceledException) { } // 超时未等到:交由 Dispose 收尾
     }
 
-    /// <summary>等待子进程 stdout 排空任务收尾(管道随进程死亡断开属正常现象)。</summary>
-    private static async Task AwaitStdoutDrainAsync(Task? drain)
+    /// <summary>等待子进程 stdout 排空(≤3s)并取回全文;排空失败/超时返回 null(管道随进程死亡断开属正常现象,任何排空异常都不得打断退出收尾)。</summary>
+    private static async Task<string?> AwaitStdoutTailAsync(Task<string>? drain)
     {
-        if (drain is null) return;
+        if (drain is null) return null;
         try
         {
             await drain.WaitAsync(TimeSpan.FromSeconds(3));
         }
-        catch (IOException) { }
-        catch (ObjectDisposedException) { }
-        catch (TimeoutException) { }
+        catch (Exception)
+        {
+            // 管道断裂(IOException)、句柄释放、等待超时等:拿不到全文就放弃尾迹
+        }
+        return drain.Status == TaskStatus.RanToCompletion ? drain.Result : null;
+    }
+
+    /// <summary>I5:stdout 尾部截取(≤2KB)并单行化(换行折叠为空格);空白归 null。</summary>
+    private static string? ToSingleLineTail(string? output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            return null;
+        const int MaxTailChars = 2048;
+        var tail = output.Length > MaxTailChars ? output[^MaxTailChars..] : output;
+        var line = tail.Replace("\r", " ").Replace("\n", " ").Trim();
+        return line.Length == 0 ? null : line;
     }
 
     private void DisposeTimersLocked()

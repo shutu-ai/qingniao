@@ -61,7 +61,9 @@ public class GpuEncoderCheckTests
 
         Assert.Equal(CheckStatus.Warn, result.Status);
         Assert.Equal("未发现硬件 H264/HEVC 编码器,串流将退回软编,性能受限", result.Summary);
-        Assert.Null(result.Detail);
+        // R14:探测的注册表路径只认部分厂商的注册方式(如 Intel QuickSync 不走此路径),
+        // Warn 必须带 Detail 说明局限,指向 M2 的 MFTEnumEx 实测为准
+        Assert.Equal("部分厂商注册方式不同(如 Intel QuickSync),以 M2 MFTEnumEx 实测为准", result.Detail);
     }
 
     // -------------------------------------------------------------- R10:读取失败 ≠ 没有编码器

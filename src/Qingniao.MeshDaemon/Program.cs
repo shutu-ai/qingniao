@@ -75,12 +75,18 @@ var orchestrator = new LinkOrchestrator(admin);
 await using var advertiser = new MdnsAdvertiser(Environment.MachineName, config.MeshPort); // R2: nodeName = MachineName
 await using var discovery = new MdnsDiscovery();
 var scanner = new VpnCidrScanner();
-var runtime = new MeshRuntime(config, host, advertiser, discovery, scanner, orchestrator);
+var runtime = new MeshRuntime(config, Environment.MachineName, host, advertiser, discovery, scanner, orchestrator); // I1: 自身名过滤
 
 orchestrator.PeerAdded += (_, link) =>
     Console.WriteLine($"[qng] 已添加 {link.Endpoint} ({link.Source})");
 host.Exited += (_, e) =>
-    Console.Error.WriteLine($"[qng] yggdrasil 进程意外退出 (pid={e.ProcessId}),看门狗将按退避自动重启");
+{
+    // I5:意外退出时把子进程自身的错误文本(配置解析、wintun 加载等)带到操作者面前
+    var line = $"[qng] yggdrasil 进程意外退出 (pid={e.ProcessId}),看门狗将按退避自动重启";
+    if (!string.IsNullOrEmpty(e.StdoutTail))
+        line += $";输出尾迹: {e.StdoutTail}";
+    Console.Error.WriteLine(line);
+};
 
 Console.WriteLine(
     $"[qng] 启动:mesh={config.MeshPort} admin={config.AdminPort} " +
@@ -93,8 +99,13 @@ try
 catch (Exception ex)
 {
     Console.Error.WriteLine($"[qng] 启动失败: {ex.Message}");
+    if (host.LastStdoutTail is { } startupTail) // I5:启动失败时附子进程输出尾迹
+        Console.Error.WriteLine($"[qng] yggdrasil 输出尾迹: {startupTail}");
     return 1;
 }
+
+if (host.SelfAddress is { } selfAddress) // M4:就绪即报本机 overlay 地址;缺失(理论上不发生)则跳过,不致命
+    Console.WriteLine($"[qng] 本机地址: {selfAddress}");
 
 // ------------------------------------------------ 周期扫描循环:立即一轮,再按间隔循环(Ctrl+C 优雅停止)
 try

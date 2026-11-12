@@ -18,6 +18,7 @@ namespace Qingniao.MeshDaemon;
 public sealed class MeshRuntime
 {
     private readonly MeshConfig _config;
+    private readonly string _ownNodeName;
     private readonly IYggdrasilHost _host;
     private readonly IMdnsAdvertiser _advertiser;
     private readonly IMdnsDiscovery _discovery;
@@ -26,9 +27,10 @@ public sealed class MeshRuntime
     private bool _started;
     private bool _stopped;
 
-    /// <summary>注入全部协作方;config 提供 VPN 网段与 Mesh 端口。</summary>
+    /// <summary>注入全部协作方;config 提供 VPN 网段与 Mesh 端口;ownNodeName 用于过滤本机自身回流(I1),与通告方一致(= Environment.MachineName)。</summary>
     public MeshRuntime(
         MeshConfig config,
+        string ownNodeName,
         IYggdrasilHost host,
         IMdnsAdvertiser advertiser,
         IMdnsDiscovery discovery,
@@ -36,12 +38,14 @@ public sealed class MeshRuntime
         ILinkOrchestrator orchestrator)
     {
         ArgumentNullException.ThrowIfNull(config);
+        ArgumentException.ThrowIfNullOrWhiteSpace(ownNodeName);
         ArgumentNullException.ThrowIfNull(host);
         ArgumentNullException.ThrowIfNull(advertiser);
         ArgumentNullException.ThrowIfNull(discovery);
         ArgumentNullException.ThrowIfNull(scanner);
         ArgumentNullException.ThrowIfNull(orchestrator);
         _config = config;
+        _ownNodeName = ownNodeName;
         _host = host;
         _advertiser = advertiser;
         _discovery = discovery;
@@ -122,18 +126,30 @@ public sealed class MeshRuntime
         await _host.StopAsync().ConfigureAwait(false);
     }
 
-    /// <summary>PeerFound 同步回调:只做分发,绝不内联处理(mDNS 接收线程不得被阻塞)。</summary>
-    private void OnPeerFound(object? sender, PeerDiscovered e) => _ = HandlePeerFoundAsync(e);
-
-    /// <summary>后台处理 mDNS 候选:IPv6 在接线处丢弃(R17,Phase 1 全 IPv4),v4 交编排器注入。</summary>
-    private async Task HandlePeerFoundAsync(PeerDiscovered e)
+    /// <summary>
+    /// PeerFound 同步回调(mDNS 接收线程):内联只做廉价判定(非 IPv4 丢弃 R17、自身节点丢弃 I1),
+    /// 零控制台 I/O、零网络 I/O(T14-1);注入与所有输出都在分发的后台任务里完成。
+    /// </summary>
+    private void OnPeerFound(object? sender, PeerDiscovered e)
     {
-        if (e.Address.AddressFamily != AddressFamily.InterNetwork)
+        string? dropReason =
+            e.Address.AddressFamily != AddressFamily.InterNetwork ? "非 IPv4" :
+            string.Equals(e.NodeName, _ownNodeName, StringComparison.OrdinalIgnoreCase) ? "自身节点" : null;
+
+        if (dropReason is null)
         {
-            Console.WriteLine($"[qng] 跳过非 IPv4 mDNS 候选 {e.NodeName} ({e.Address})");
+            _ = HandlePeerFoundAsync(e); // 既有 fire-and-forget 注入路径
             return;
         }
 
+        // T14-1:mDNS 接收线程零控制台 I/O——跳过说明也进后台任务
+        _ = Task.Run(() =>
+            Console.WriteLine($"[qng] 跳过{dropReason} mDNS 候选 {e.NodeName} ({e.Address})"));
+    }
+
+    /// <summary>后台处理 mDNS 候选:v4 交编排器注入;单候选失败不中止后续候选。</summary>
+    private async Task HandlePeerFoundAsync(PeerDiscovered e)
+    {
         try
         {
             await _orchestrator.TryAddPeerAsync(new PeerCandidate("mdns", e.Address, e.Port))

@@ -12,6 +12,7 @@ public sealed class GpuEncoderCheck : IEnvironmentCheck
     public const string CheckName = "gpu-encoder";
 
     private const string WarnSummary = "未发现硬件 H264/HEVC 编码器,串流将退回软编,性能受限";
+    private const string WarnDetail = "部分厂商注册方式不同(如 Intel QuickSync),以 M2 MFTEnumEx 实测为准";
     private const string UnknownSummary = "注册表读取失败";
 
     private readonly Func<IRegistryAdapter> _createAdapter;
@@ -38,7 +39,7 @@ public sealed class GpuEncoderCheck : IEnvironmentCheck
         }
 
         return Task.FromResult(encoders.Count == 0
-            ? new CheckResult(Name, CheckStatus.Warn, WarnSummary)
+            ? new CheckResult(Name, CheckStatus.Warn, WarnSummary, WarnDetail)
             : new CheckResult(Name, CheckStatus.Pass, $"硬件编码器: {string.Join(", ", encoders.Select(e => e.Name))}"));
     }
 }
