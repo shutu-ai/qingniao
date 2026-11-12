@@ -6,14 +6,25 @@ using Qingniao.Mesh;
 
 namespace Qingniao.Mesh.Tests;
 
-/// <summary>AdminSocketClient 对进程内真实 TcpListener 假服务器的协议测试(真实 socket,不 mock 被测代码)。</summary>
+/// <summary>
+/// AdminSocketClient 对进程内真实 TcpListener 假服务器的协议测试(真实 socket,不 mock 被测代码)。
+/// 假服务器按真实 yggdrasil v0.5.15 行为应答:多行 pretty JSON(SetIndent("", "  "));
+/// 请求侧断言真实信封(R21):request + arguments 对象。
+/// </summary>
 public class AdminSocketClientTests
 {
     [Fact]
-    public async Task SendAsync_GetSelf_ParsesSuccessPayload()
+    public async Task SendAsync_GetSelf_ParsesMultilinePrettyPayload()
     {
-        using var server = FakeAdminServer.Start(_ =>
-            "{\"status\":\"success\",\"response\":{\"address\":\"202:a:b:c:d:e:f:g\",\"key\":\"pub0\"}}");
+        using var server = FakeAdminServer.Start(_ => """
+            {
+              "status": "success",
+              "response": {
+                "address": "202:a:b:c:d:e:f:g",
+                "key": "pub0"
+              }
+            }
+            """);
         using var client = new AdminSocketClient(port: server.Port);
 
         var response = await client.SendAsync(AdminRequest.GetSelf());
@@ -26,9 +37,14 @@ public class AdminSocketClientTests
     }
 
     [Fact]
-    public async Task SendAsync_AddPeer_SendsCommandLineJson()
+    public async Task SendAsync_AddPeer_SendsRequestWithNestedArguments()
     {
-        using var server = FakeAdminServer.Start(_ => "{\"status\":\"success\",\"response\":{}}");
+        using var server = FakeAdminServer.Start(_ => """
+            {
+              "status": "success",
+              "response": {}
+            }
+            """);
         using var client = new AdminSocketClient(port: server.Port);
 
         var response = await client.SendAsync(AdminRequest.AddPeer("tcp://10.0.0.5:13371"));
@@ -36,17 +52,41 @@ public class AdminSocketClientTests
         Assert.True(response.Success);
         var sent = server.LastRequestLine;
         Assert.NotNull(sent);
-        Assert.Contains("\"request\":\"addPeer\"", sent);
-        Assert.Contains("\"uri\":\"tcp://10.0.0.5:13371\"", sent);
         using var doc = JsonDocument.Parse(sent);
         Assert.Equal("addPeer", doc.RootElement.GetProperty("request").GetString());
-        Assert.Equal("tcp://10.0.0.5:13371", doc.RootElement.GetProperty("uri").GetString());
+        // R21(a):真实 yggdrasil 从 arguments 对象取 handler 参数;顶层字段会被忽略
+        var arguments = doc.RootElement.GetProperty("arguments");
+        Assert.Equal("tcp://10.0.0.5:13371", arguments.GetProperty("uri").GetString());
+    }
+
+    [Fact]
+    public async Task SendAsync_GetSelf_OmitsArgumentsKey()
+    {
+        // 无参数请求省略 arguments 键(R21a 文档化选择;真实 yggdrasil 的 arguments 带 omitempty)
+        using var server = FakeAdminServer.Start(_ => """
+            {
+              "status": "success",
+              "response": {}
+            }
+            """);
+        using var client = new AdminSocketClient(port: server.Port);
+
+        await client.SendAsync(AdminRequest.GetSelf());
+
+        using var doc = JsonDocument.Parse(server.LastRequestLine!);
+        Assert.Equal("getSelf", doc.RootElement.GetProperty("request").GetString());
+        Assert.False(doc.RootElement.TryGetProperty("arguments", out _));
     }
 
     [Fact]
     public async Task SendAsync_ErrorResponse_ReportsError()
     {
-        using var server = FakeAdminServer.Start(_ => "{\"status\":\"error\",\"error\":\"peer already connected\"}");
+        using var server = FakeAdminServer.Start(_ => """
+            {
+              "status": "error",
+              "error": "peer already connected"
+            }
+            """);
         using var client = new AdminSocketClient(port: server.Port);
 
         var response = await client.SendAsync(AdminRequest.AddPeer("tcp://10.0.0.5:13371"));
@@ -59,13 +99,13 @@ public class AdminSocketClientTests
     [Fact]
     public async Task SendAsync_NoResponse_ThrowsTimeoutException()
     {
-        using var server = FakeAdminServer.Start(_ => null); // 收到请求后不回包
+        using var server = FakeAdminServer.Start(_ => null); // 收到请求后不回包(T4:保持连接挂起)
         using var client = new AdminSocketClient(port: server.Port, timeoutMs: 300);
 
         await Assert.ThrowsAsync<TimeoutException>(() => client.SendAsync(AdminRequest.GetSelf()));
     }
 
-    /// <summary>进程内 yggdrasil admin 假服务器:逐连接读一行,交给 handler,回一行;handler 返回 null 则保持连接挂起不回包。</summary>
+    /// <summary>进程内 yggdrasil admin 假服务器:逐连接读一行请求,交给 handler,回多行 pretty JSON;handler 返回 null 则保持连接挂起不回包。</summary>
     private sealed class FakeAdminServer : IDisposable
     {
         private readonly TcpListener _listener;
@@ -120,7 +160,8 @@ public class AdminSocketClientTests
             var response = handler(line);
             if (response is null) return; // 不回包、不断开
             await using var writer = new StreamWriter(stream, new UTF8Encoding(false), bufferSize: 1024, leaveOpen: true) { NewLine = "\n", AutoFlush = true };
-            await writer.WriteLineAsync(response.AsMemory(), _cts.Token);
+            await writer.WriteAsync(response.AsMemory(), _cts.Token);
+            await writer.WriteAsync("\n".AsMemory(), _cts.Token); // pretty JSON 以单个换行收尾(真实实现对齐 SetIndent 输出)
         }
 
         public void Dispose()

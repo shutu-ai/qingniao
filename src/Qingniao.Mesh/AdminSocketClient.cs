@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace Qingniao.Mesh;
 
-/// <summary>一条 yggdrasil admin 请求:命令名与附加字段(如 addPeer 的 uri)。</summary>
+/// <summary>一条 yggdrasil admin 请求:命令名与 arguments 参数对象(如 addPeer 的 uri)。</summary>
 public sealed record AdminRequest(string Request, IReadOnlyDictionary<string, string> Fields)
 {
     private static readonly IReadOnlyDictionary<string, string> NoFields = new Dictionary<string, string>();
@@ -37,8 +37,11 @@ public sealed record AdminResponse(bool Success, string? Error, JsonElement Payl
 }
 
 /// <summary>
-/// yggdrasil admin socket 行式 JSON 客户端:每次 SendAsync 建一条连接,写一行 JSON 请求、读一行 JSON 响应。
-/// 整次调用受 timeoutMs 约束(经 CancellationToken 传导);内部超时抛 TimeoutException,外部取消仍抛 OperationCanceledException。
+/// yggdrasil admin socket 客户端(对齐真实 v0.5.15 行为,R21):每次 SendAsync 建一条连接,
+/// 写一行 JSON 请求(request + arguments 信封),再累计读取响应——真实响应是多行 pretty JSON
+/// (SetIndent("", "  ")),故每次读取后尝试解析,成功即返回;EOF 后仍不可解析走 FormatException。
+/// 一请求一连接,读至解析成功是安全的(对端应答后关闭)。整次调用受 timeoutMs 约束
+/// (经 CancellationToken 传导);内部超时抛 TimeoutException,外部取消仍抛 OperationCanceledException。
 /// </summary>
 public sealed class AdminSocketClient : IDisposable
 {
@@ -106,10 +109,37 @@ public sealed class AdminSocketClient : IDisposable
         await using var writer = new StreamWriter(stream, Utf8NoBom) { NewLine = "\n", AutoFlush = true };
         using var reader = new StreamReader(stream, Utf8NoBom, detectEncodingFromByteOrderMarks: false);
         await writer.WriteLineAsync(Serialize(request).AsMemory(), timeoutToken);
-        var line = await reader.ReadLineAsync(timeoutToken); // 对端不会半关闭,等一整行或超时
-        if (line is null)
+
+        // 真实响应是多行 pretty JSON:累计读取,每次尝试解析,成功即返回;EOF 后交给 ParseResponse 收口
+        var accumulated = new StringBuilder();
+        var buffer = new char[4096];
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), timeoutToken);
+            if (read == 0)
+                break; // EOF:yggdrasil 应答后关闭连接
+            accumulated.Append(buffer, 0, read);
+            if (ParsesAsJson(accumulated))
+                return ParseResponse(accumulated.ToString());
+        }
+
+        if (accumulated.Length == 0)
             throw new IOException("admin 连接在收到响应前被对端关闭");
-        return ParseResponse(line);
+        return ParseResponse(accumulated.ToString());
+    }
+
+    /// <summary>累计缓冲目前是否已构成一份完整 JSON 文档(部分响应解析必失败,故成功即完整)。</summary>
+    private static bool ParsesAsJson(StringBuilder text)
+    {
+        try
+        {
+            using var _ = JsonDocument.Parse(text.ToString());
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static string Serialize(AdminRequest request)
@@ -118,24 +148,31 @@ public sealed class AdminSocketClient : IDisposable
         using var writer = new Utf8JsonWriter(buffer);
         writer.WriteStartObject();
         writer.WriteString("request", request.Request);
-        foreach (var field in request.Fields)
-            writer.WriteString(field.Key, field.Value);
+        if (request.Fields.Count > 0)
+        {
+            // R21(a):真实 yggdrasil 从 arguments 对象取 handler 参数,顶层字段会被忽略;
+            // 无参数请求省略该键(与 Go 侧 arguments,omitempty 语义一致)
+            writer.WriteStartObject("arguments");
+            foreach (var field in request.Fields)
+                writer.WriteString(field.Key, field.Value);
+            writer.WriteEndObject();
+        }
         writer.WriteEndObject();
         writer.Flush();
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 
-    private static AdminResponse ParseResponse(string line)
+    private static AdminResponse ParseResponse(string text)
     {
         JsonElement root;
         try
         {
-            using var document = JsonDocument.Parse(line);
+            using var document = JsonDocument.Parse(text);
             root = document.RootElement.Clone();
         }
         catch (JsonException exception)
         {
-            throw new FormatException($"admin 响应不是合法 JSON:{line}", exception);
+            throw new FormatException($"admin 响应不是合法 JSON:{text}", exception);
         }
 
         if (GetStringProperty(root, "status") == "success")

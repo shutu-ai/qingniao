@@ -57,7 +57,9 @@ public sealed class LinkOrchestrator : ILinkOrchestrator
             return false; // 幂等 1:已注入,零 admin 请求
 
         var peers = await _admin.SendAsync(AdminRequest.GetPeers(), ct).ConfigureAwait(false);
-        // 幂等 2:yggdrasil 已有该 peer(按字符串值匹配 "ip:port",不绑定其字段名)。
+        // 幂等 2:yggdrasil 已有该 peer(按字符串值匹配 "ip:port",不绑定其字段名与 scheme,R19)。
+        // 匹配须边界受控(T13-1):"110.0.0.5:13371" 子串含 "10.0.0.5:13371"、":13371" 含 ":1337",
+        // 裸 Contains 的假阳性会永久误压真实 peer。
         // getPeers 失败时 Payload 为 Undefined → 视为未包含,继续 addPeer,由其失败兜底。
         if (ContainsString(peers.Payload, $"{candidate.Address}:{candidate.Port}"))
             return false;
@@ -80,13 +82,13 @@ public sealed class LinkOrchestrator : ILinkOrchestrator
     public IReadOnlyList<LinkInfo> Snapshot() =>
         _peers.Values.OrderBy(link => link.AddedAt).ToArray();
 
-    /// <summary>递归遍历 JSON 树(对象/数组任意嵌套),任一字符串值含 needle 即真;属性名不参与匹配。</summary>
+    /// <summary>递归遍历 JSON 树(对象/数组任意嵌套),任一字符串值边界受控地含 needle 即真;属性名不参与匹配。</summary>
     private static bool ContainsString(JsonElement element, string needle)
     {
         switch (element.ValueKind)
         {
             case JsonValueKind.String:
-                return element.GetString()?.Contains(needle, StringComparison.Ordinal) == true;
+                return element.GetString() is { } text && ContainsBoundaryMatch(text, needle);
             case JsonValueKind.Object:
                 foreach (var property in element.EnumerateObject())
                 {
@@ -105,4 +107,35 @@ public sealed class LinkOrchestrator : ILinkOrchestrator
                 return false;
         }
     }
+
+    /// <summary>
+    /// 边界受控包含判定(T13-1/R19,不假设 scheme):扫描全部出现位置,某次出现的
+    /// 起点前字符不是 [0-9.] 且终点后字符不是 [0-9:] 才算命中——前者防 "110.0.0.5" 内含
+    /// "10.0.0.5" 的地址前缀假阳性,后者防 ":13371" 内含 ":1337" 的端口假阳性。
+    /// </summary>
+    private static bool ContainsBoundaryMatch(string text, string needle)
+    {
+        if (text.Length == 0 || needle.Length == 0)
+            return false;
+
+        var from = 0;
+        while (true)
+        {
+            var index = text.IndexOf(needle, from, StringComparison.Ordinal);
+            if (index < 0)
+                return false;
+            var end = index + needle.Length;
+            var beforeIsBoundary = index == 0 || !IsAddressChar(text[index - 1]);
+            var afterIsBoundary = end == text.Length || !IsPortTailChar(text[end]);
+            if (beforeIsBoundary && afterIsBoundary)
+                return true;
+            from = index + 1; // 该出现位置被边界否决:继续扫后续出现,不只是在第一处下结论
+        }
+    }
+
+    /// <summary>地址字符:匹配起点前若是数字或点,说明命中的是更长地址的尾部(如 110.0.0.5 ⊃ 10.0.0.5)。</summary>
+    private static bool IsAddressChar(char c) => c is >= '0' and <= '9' or '.';
+
+    /// <summary>端口字符:匹配终点后若是数字或冒号,说明命中的是更长端口串的前缀(如 :13371 ⊃ :1337)。</summary>
+    private static bool IsPortTailChar(char c) => c is >= '0' and <= '9' or ':';
 }

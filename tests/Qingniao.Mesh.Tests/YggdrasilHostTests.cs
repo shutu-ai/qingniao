@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading; // HostFixture 清理重试用 Thread.Sleep
 using Qingniao.Core;
 using Qingniao.Mesh;
@@ -249,8 +250,12 @@ public class YggdrasilHostTests
     [Fact]
     public async Task AddPeerAsync_ForwardsAddPeerRequestViaAdminSocket()
     {
-        using var server = FakeAdminServer.Start(_ =>
-            "{\"status\":\"success\",\"response\":{}}");
+        using var server = FakeAdminServer.Start(_ => """
+            {
+              "status": "success",
+              "response": {}
+            }
+            """);
         var config = new MeshConfig { AdminPort = server.Port, YggdrasilExePath = "no/such/exe.exe" };
         await using var host = new YggdrasilHost(config); // 未 StartAsync 也可转发(薄封装)
 
@@ -259,8 +264,11 @@ public class YggdrasilHostTests
         Assert.True(response.Success);
         var sent = server.LastRequestLine;
         Assert.NotNull(sent);
-        Assert.Contains("\"request\":\"addPeer\"", sent);
-        Assert.Contains("\"uri\":\"tcp://10.0.0.5:13371\"", sent);
+        using var doc = JsonDocument.Parse(sent);
+        Assert.Equal("addPeer", doc.RootElement.GetProperty("request").GetString());
+        Assert.Equal(
+            "tcp://10.0.0.5:13371",
+            doc.RootElement.GetProperty("arguments").GetProperty("uri").GetString());
     }
 
     // ------------------------------------------------------------- helpers
@@ -331,8 +339,17 @@ public class YggdrasilHostTests
             var exePath = childKind == ChildKind.LongLived ? CompileLongLivedChild(_dir) : CopyPing(_dir);
             ConfPath = Path.Combine(_dir, "qingniao-ygg.conf");
 
+            // 真实 yggdrasil 应答为多行 pretty JSON(SetIndent("", "  ")),假服务器同形(R21b)
             _server = FakeAdminServer.Start(_ => withAdminServer
-                ? $"{{\"status\":\"success\",\"response\":{{\"address\":\"{FakeAddress}\",\"key\":\"{FakeKey}\"}}}}"
+                ? $$"""
+                    {
+                      "status": "success",
+                      "response": {
+                        "address": "{{FakeAddress}}",
+                        "key": "{{FakeKey}}"
+                      }
+                    }
+                    """
                 : null);
 
             Config = new MeshConfig

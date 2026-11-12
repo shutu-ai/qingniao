@@ -11,7 +11,9 @@ namespace Qingniao.LinkManager.Tests;
 /// <summary>
 /// LinkOrchestrator 幂等注入测试:对进程内真实 TcpListener 假 admin 服务器(真实 socket,不 mock 被测代码;
 /// 沿用 AdminSocketClientTests 的假服务器模式,并按命令计数以钉死幂等的"零请求"语义)。
-/// 对应 Review Focus #5 场景 (a)-(e)。
+/// 假服务器按真实 yggdrasil v0.5.15 行为应答:多行 pretty JSON(SetIndent("", "  "),R21b);
+/// 请求侧断言真实信封 request + arguments(R21a)。
+/// 对应 Review Focus #5 场景 (a)-(e);T13-1/R19 场景覆盖 getPeers 扫描的边界匹配。
 /// </summary>
 public sealed class LinkOrchestratorTests
 {
@@ -20,8 +22,8 @@ public sealed class LinkOrchestratorTests
     {
         // (a) 首次添加成功:getPeers 空 peers → addPeer success
         using var server = FakeAdminServer.Start(
-            "{\"status\":\"success\",\"response\":{\"peers\":[]}}",
-            "{\"status\":\"success\",\"response\":{}}");
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
         using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
         var orchestrator = new LinkOrchestrator(admin);
         var fired = new List<LinkInfo>();
@@ -39,10 +41,12 @@ public sealed class LinkOrchestratorTests
         Assert.Equal("tcp://10.0.0.5:13371", fired[0].Endpoint);
         Assert.Equal(1, server.CountFor("getPeers"));
         Assert.Equal(1, server.CountFor("addPeer"));
-        // addPeer 的 uri 必须是精确的 candidate ip:port
+        // addPeer 的 uri 必须是 arguments.uri 内精确的 candidate ip:port(R21a:真实信封)
         using var lastRequest = JsonDocument.Parse(server.LastRequestLine!);
         Assert.Equal("addPeer", lastRequest.RootElement.GetProperty("request").GetString());
-        Assert.Equal("tcp://10.0.0.5:13371", lastRequest.RootElement.GetProperty("uri").GetString());
+        Assert.Equal(
+            "tcp://10.0.0.5:13371",
+            lastRequest.RootElement.GetProperty("arguments").GetProperty("uri").GetString());
     }
 
     [Fact]
@@ -51,10 +55,10 @@ public sealed class LinkOrchestratorTests
         // (b) 重复添加同一 candidate:返回 false,对假 admin 的请求计数不变(幂等)
         // 后两条脚本仅供"幂等失效时误消耗"用:一旦被消耗,下方计数断言即失败。
         using var server = FakeAdminServer.Start(
-            "{\"status\":\"success\",\"response\":{\"peers\":[]}}",
-            "{\"status\":\"success\",\"response\":{}}",
-            "{\"status\":\"success\",\"response\":{\"peers\":[]}}",
-            "{\"status\":\"success\",\"response\":{}}");
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"),
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
         using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
         var orchestrator = new LinkOrchestrator(admin);
         var fired = 0;
@@ -77,8 +81,8 @@ public sealed class LinkOrchestratorTests
     {
         // (c) getPeers 已含该 peer:返回 false 且零 addPeer 请求(不绑定字段名:匹配的是字符串值中的 "ip:port")
         using var server = FakeAdminServer.Start(
-            "{\"status\":\"success\",\"response\":{\"peers\":[{\"endpoint\":\"tcp://10.0.0.5:13371\",\"up\":true}]}}",
-            "{\"status\":\"success\",\"response\":{}}"); // 仅误消耗时用
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[{\"endpoint\":\"tcp://10.0.0.5:13371\",\"up\":true}]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}")); // 仅误消耗时用
         using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
         var orchestrator = new LinkOrchestrator(admin);
 
@@ -97,8 +101,8 @@ public sealed class LinkOrchestratorTests
     {
         // (c 递归钉死)字符串深埋于 对象→数组→数组→对象,且字段名任意:递归扫描不做字段名绑定
         using var server = FakeAdminServer.Start(
-            "{\"status\":\"success\",\"response\":{\"swog\":{\"foo\":[{\"bar\":[[\"x\",{\"deep\":\"tcp://10.0.0.5:13371\"}]]}]}}}",
-            "{\"status\":\"success\",\"response\":{}}"); // 仅误消耗时用
+            Pretty("{\"status\":\"success\",\"response\":{\"swog\":{\"foo\":[{\"bar\":[[\"x\",{\"deep\":\"tcp://10.0.0.5:13371\"}]]}]}}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}")); // 仅误消耗时用
         using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
         var orchestrator = new LinkOrchestrator(admin);
 
@@ -111,15 +115,109 @@ public sealed class LinkOrchestratorTests
         Assert.Empty(orchestrator.Snapshot());
     }
 
+    // ------------------------------------------------------- T13-1/R19:边界匹配
+
+    [Fact]
+    public async Task TryAddPeerAsync_GetPeersHasIpPrefixFalsePositive_NotSuppressed()
+    {
+        // T13-1:"110.0.0.5:13371" 子串含 "10.0.0.5:13371",但起点前是数字 → 不是已有 peer,addPeer 照常
+        using var server = FakeAdminServer.Start(
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[\"tcp://110.0.0.5:13371\"]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
+        using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
+        var orchestrator = new LinkOrchestrator(admin);
+
+        var added = await orchestrator.TryAddPeerAsync(
+            new PeerCandidate("mdns", IPAddress.Parse("10.0.0.5"), 13371));
+
+        Assert.True(added);
+        Assert.Equal(1, server.CountFor("getPeers"));
+        Assert.Equal(1, server.CountFor("addPeer"));
+        Assert.Single(orchestrator.Snapshot());
+    }
+
+    [Fact]
+    public async Task TryAddPeerAsync_GetPeersHasPortSuffixFalsePositive_NotSuppressed()
+    {
+        // T13-1:"10.0.0.5:133719" 含 "10.0.0.5:13371",但终点后是数字 → 不是已有 peer,addPeer 照常
+        using var server = FakeAdminServer.Start(
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[\"tcp://10.0.0.5:133719\"]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
+        using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
+        var orchestrator = new LinkOrchestrator(admin);
+
+        var added = await orchestrator.TryAddPeerAsync(
+            new PeerCandidate("mdns", IPAddress.Parse("10.0.0.5"), 13371));
+
+        Assert.True(added);
+        Assert.Equal(1, server.CountFor("getPeers"));
+        Assert.Equal(1, server.CountFor("addPeer"));
+    }
+
+    [Fact]
+    public async Task TryAddPeerAsync_GetPeersHasPortPrefixFalsePositive_NotSuppressed()
+    {
+        // T13-1(反向):候选端口 1337,getPeers 含 "10.0.0.5:13371"(":13371" 含 ":1337")→ 终点后是数字,不抑制
+        using var server = FakeAdminServer.Start(
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[\"tcp://10.0.0.5:13371\"]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
+        using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
+        var orchestrator = new LinkOrchestrator(admin);
+
+        var added = await orchestrator.TryAddPeerAsync(
+            new PeerCandidate("mdns", IPAddress.Parse("10.0.0.5"), 1337));
+
+        Assert.True(added);
+        Assert.Equal(1, server.CountFor("addPeer"));
+    }
+
+    [Fact]
+    public async Task TryAddPeerAsync_GetPeersExactStandaloneValue_Suppressed()
+    {
+        // R19(不假设 scheme):getPeers 字符串值本身就是裸 "ip:port" → 精确命中,抑制 addPeer
+        using var server = FakeAdminServer.Start(
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[\"10.0.0.5:13371\"]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
+        using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
+        var orchestrator = new LinkOrchestrator(admin);
+
+        var added = await orchestrator.TryAddPeerAsync(
+            new PeerCandidate("mdns", IPAddress.Parse("10.0.0.5"), 13371));
+
+        Assert.False(added);
+        Assert.Equal(1, server.CountFor("getPeers"));
+        Assert.Equal(0, server.CountFor("addPeer"));
+        Assert.Empty(orchestrator.Snapshot());
+    }
+
+    [Fact]
+    public async Task TryAddPeerAsync_GetPeersEmbeddedInLongerString_Suppressed()
+    {
+        // R19:命中嵌在更长字符串里,但前后边界字符均非 [0-9.]/[0-9:] → 有效命中,抑制 addPeer
+        using var server = FakeAdminServer.Start(
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[\"peer(10.0.0.5:13371);\"]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
+        using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
+        var orchestrator = new LinkOrchestrator(admin);
+
+        var added = await orchestrator.TryAddPeerAsync(
+            new PeerCandidate("mdns", IPAddress.Parse("10.0.0.5"), 13371));
+
+        Assert.False(added);
+        Assert.Equal(1, server.CountFor("getPeers"));
+        Assert.Equal(0, server.CountFor("addPeer"));
+        Assert.Empty(orchestrator.Snapshot());
+    }
+
     [Fact]
     public async Task Snapshot_PreviousSnapshotUnchangedAndNewArrayAfterAdd()
     {
         // (d) 不可变性:先取快照 s1,再成功添加 peer,s1 不变;且每次 Snapshot 返回新数组
         using var server = FakeAdminServer.Start(
-            "{\"status\":\"success\",\"response\":{\"peers\":[]}}",
-            "{\"status\":\"success\",\"response\":{}}",
-            "{\"status\":\"success\",\"response\":{\"peers\":[]}}",
-            "{\"status\":\"success\",\"response\":{}}");
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"),
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[]}}"),
+            Pretty("{\"status\":\"success\",\"response\":{}}"));
         using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
         var orchestrator = new LinkOrchestrator(admin);
 
@@ -146,8 +244,8 @@ public sealed class LinkOrchestratorTests
     {
         // (e) addPeer 返回 error:返回 false,错误暂存 LastError,不入快照、不触发事件
         using var server = FakeAdminServer.Start(
-            "{\"status\":\"success\",\"response\":{\"peers\":[]}}",
-            "{\"status\":\"error\",\"error\":\"peer already connected\"}");
+            Pretty("{\"status\":\"success\",\"response\":{\"peers\":[]}}"),
+            Pretty("{\"status\":\"error\",\"error\":\"peer already connected\"}"));
         using var admin = new AdminSocketClient(port: server.Port, timeoutMs: 300);
         var orchestrator = new LinkOrchestrator(admin);
         var fired = 0;
@@ -164,8 +262,15 @@ public sealed class LinkOrchestratorTests
         Assert.Equal(1, server.CountFor("addPeer"));
     }
 
+    /// <summary>把紧凑 JSON 重排为多行缩进形式,模拟真实 yggdrasil 的 SetIndent("", "  ") 输出(R21b)。</summary>
+    private static string Pretty(string compact)
+    {
+        using var document = JsonDocument.Parse(compact);
+        return JsonSerializer.Serialize(document.RootElement, new JsonSerializerOptions { WriteIndented = true });
+    }
+
     /// <summary>
-    /// 进程内 yggdrasil admin 假服务器:逐连接读一行请求,按脚本队列回一行(AdminSocketClient 每次 SendAsync 一条连接);
+    /// 进程内 yggdrasil admin 假服务器:逐连接读一行请求,按脚本队列回多行 pretty JSON(AdminSocketClient 每次 SendAsync 一条连接);
     /// 记录每命令的请求数与最后请求行,供幂等"零请求"断言。脚本耗尽即不回包(真实挂起,客户端超时)。
     /// </summary>
     private sealed class FakeAdminServer : IDisposable
