@@ -8,11 +8,24 @@ namespace Qingniao.Mesh;
 public sealed record HostExitedEventArgs(int ProcessId);
 
 /// <summary>
+/// yggdrasil 托管的最小抽象(R15,Task 14):仅暴露 MeshRuntime 组装所需的启停成员,
+/// 便于测试以假件注入。<see cref="YggdrasilHost"/> 为生产实现。
+/// </summary>
+public interface IYggdrasilHost
+{
+    /// <summary>写配置、拉起子进程并轮询 admin 至就绪。</summary>
+    Task StartAsync(CancellationToken ct = default);
+
+    /// <summary>停止托管并杀死子进程树。幂等。</summary>
+    Task StopAsync();
+}
+
+/// <summary>
 /// yggdrasil 子进程托管:写配置、拉起进程、轮询 admin 健康检查,并以指数退避看门狗在进程意外退出后自动重启。
 /// 语义约定:<see cref="Exited"/> 仅在进程意外退出时触发(计划内 <see cref="StopAsync"/> 不触发);
 /// 重启失败的错误不冒泡——看门狗通过杀掉残留子进程使其退出,借 <see cref="Exited"/> 链路排入下一轮退避。
 /// </summary>
-public sealed class YggdrasilHost : IAsyncDisposable
+public sealed class YggdrasilHost : IYggdrasilHost, IAsyncDisposable
 {
     private const string ConfFileName = "qingniao-ygg.conf";
 

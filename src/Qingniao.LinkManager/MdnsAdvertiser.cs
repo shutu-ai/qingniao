@@ -5,6 +5,19 @@ using Makaretu.Dns;
 namespace Qingniao.LinkManager;
 
 /// <summary>
+/// mDNS 通告的最小抽象(R15,Task 14):仅暴露 MeshRuntime 组装所需的启停成员。
+/// 注意:实现一 Stop 再 Start 会静默失效(库清空处理器),调用方须 Start 一次、Stop 一次。
+/// </summary>
+public interface IMdnsAdvertiser
+{
+    /// <summary>开始通告。幂等:已在运行时直接返回。</summary>
+    Task StartAsync(CancellationToken ct = default);
+
+    /// <summary>停止通告(尽力发送 goodbye)。幂等。</summary>
+    Task StopAsync();
+}
+
+/// <summary>
 /// 通过 mDNS(DNS-SD)向局域网通告本节点:服务类型 <c>_qingniao._udp.local</c>,
 /// 实例名 = 节点名,TXT 含 <c>node=&lt;nodeName&gt;</c>,SRV 端口 = meshPort。
 /// </summary>
@@ -12,7 +25,7 @@ namespace Qingniao.LinkManager;
 /// 实现基于 Makaretu.Dns.Multicast(以 0.27.0 API 为准);本类接口契约不依赖该库的具体形状。
 /// 地址通告取 <see cref="PeerAddressFilter"/> 过滤后的本机地址,避免 loopback/链路本地等误报。
 /// </remarks>
-public sealed class MdnsAdvertiser : IAsyncDisposable
+public sealed class MdnsAdvertiser : IMdnsAdvertiser, IAsyncDisposable
 {
     /// <summary>服务类型(DNS-SD 的 "_service._udp" 形式);完整服务名为 _qingniao._udp.local。</summary>
     public const string ServiceType = "_qingniao._udp";

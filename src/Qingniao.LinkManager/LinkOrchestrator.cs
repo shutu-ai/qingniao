@@ -5,12 +5,25 @@ using Qingniao.Mesh;
 namespace Qingniao.LinkManager;
 
 /// <summary>
+/// peer 注入编排的最小抽象(R15,Task 14):仅暴露 MeshRuntime/Program 消费成员——
+/// 幂等注入与 PeerAdded 事件。admin I/O 由实现内部持有,不进抽象。
+/// </summary>
+public interface ILinkOrchestrator
+{
+    /// <summary>注入一个 peer 候选(幂等:重复候选零 admin 请求,返回 false)。</summary>
+    Task<bool> TryAddPeerAsync(PeerCandidate candidate, CancellationToken ct = default);
+
+    /// <summary>候选注入成功(addPeer 成功并记入链路表)时触发。</summary>
+    event EventHandler<LinkInfo>? PeerAdded;
+}
+
+/// <summary>
 /// 幂等 peer 注入编排:查内存表去重 → getPeers 响应全树扫描去重 → addPeer,
 /// 成功才记入不可变链路状态表并触发 PeerAdded;失败原因暂存 <see cref="LastError"/> 留作调试事件(本阶段无日志框架)。
 /// 并发说明:单调用方语义精确;mDNS/VPN 多调用方并发时,"查表 → getPeers → addPeer" 序列为尽力而为,
 /// 以内存表条目为准,不额外加锁串行化。
 /// </summary>
-public sealed class LinkOrchestrator
+public sealed class LinkOrchestrator : ILinkOrchestrator
 {
     private readonly AdminSocketClient _admin;
     private readonly ConcurrentDictionary<string, LinkInfo> _peers = new();

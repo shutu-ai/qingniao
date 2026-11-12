@@ -1,0 +1,7 @@
+{
+  "meshPort": 13371,
+  "adminPort": 13372,
+  "vpnCidrs": [],
+  "yggdrasilExePath": "tools/yggdrasil/yggdrasil.exe",
+  "bandwidthEndpoint": null
+}

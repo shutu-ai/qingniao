@@ -4,6 +4,22 @@ using Makaretu.Dns;
 
 namespace Qingniao.LinkManager;
 
+/// <summary>
+/// mDNS 发现的最小抽象(R15,Task 14):仅暴露 MeshRuntime 组装所需成员——PeerFound 事件与启停。
+/// 注意:实现一 Stop 再 Start 会静默失效(库清空处理器),调用方须 Start 一次、Stop 一次。
+/// </summary>
+public interface IMdnsDiscovery
+{
+    /// <summary>发现到节点时触发;事件在 mDNS 接收线程上同步回调,处理器不得阻塞。</summary>
+    event EventHandler<PeerDiscovered>? PeerFound;
+
+    /// <summary>开始发现并浏览 _qingniao._udp.local 实例。幂等。</summary>
+    Task StartAsync(CancellationToken ct = default);
+
+    /// <summary>停止发现并清空发现状态。幂等。</summary>
+    Task StopAsync();
+}
+
 /// <summary>mDNS 发现到的节点(通告地址已通过 <see cref="PeerAddressFilter"/> 过滤)。</summary>
 /// <param name="NodeName">节点名(= 通告方服务实例名)。</param>
 /// <param name="Address">节点的可达地址(IPv4/IPv6)。</param>
@@ -19,7 +35,7 @@ public sealed record PeerDiscovered(string NodeName, IPAddress Address, int Port
 /// <see cref="PeerAddressFilter"/> 过滤后触发 <see cref="PeerFound"/>。
 /// 重复通告不去重(同一节点可能多次触发,由上层编排);TTL 过期与刷新不在本期范围。
 /// </remarks>
-public sealed class MdnsDiscovery : IAsyncDisposable
+public sealed class MdnsDiscovery : IMdnsDiscovery, IAsyncDisposable
 {
     /// <summary>本服务类型在 local 域下的完整服务名。</summary>
     public const string ServiceTypeFqdn = MdnsAdvertiser.ServiceType + ".local";

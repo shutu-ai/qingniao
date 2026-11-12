@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Qingniao.Mesh\Qingniao.Mesh.csproj" />
+    <ProjectReference Include="..\..\src\Qingniao.MeshDaemon\Qingniao.MeshDaemon.csproj" />
   </ItemGroup>
 
 </Project>

@@ -5,6 +5,14 @@ using System.Runtime.CompilerServices;
 
 namespace Qingniao.LinkManager;
 
+/// <summary>VPN 网段扫描的最小抽象(R15,Task 14):仅暴露 MeshRuntime 组装所需的 ScanAsync。</summary>
+public interface IVpnCidrScanner
+{
+    /// <summary>扫描全部 CIDR,逐个产出存活探测结果(完成顺序)。取消经 <paramref name="ct"/> 传播。</summary>
+    IAsyncEnumerable<ProbeResult> ScanAsync(
+        IReadOnlyList<string> cidrs, int port, CancellationToken ct = default);
+}
+
 /// <summary>单台主机的 TCP 存活探测结果。<see cref="LatencyMs"/> 恒 ≥ 0(未连通也报告实际耗时)。</summary>
 /// <param name="Address">被探测的主机地址。</param>
 /// <param name="IsOpen">TCP 连接是否成功建立。</param>
@@ -19,7 +27,7 @@ public sealed record ProbeResult(IPAddress Address, bool IsOpen, int LatencyMs);
 /// <see cref="ProbeResult"/>(<c>IsOpen=false</c>),不会使扫描中断;CIDR 字符串非法属于调用方编程错误,原样抛出。
 /// 结果按完成顺序产出(不保证地址顺序)。取消令牌触发后立即停止调度新探测并终止流。
 /// </remarks>
-public sealed class VpnCidrScanner
+public sealed class VpnCidrScanner : IVpnCidrScanner
 {
     /// <summary>同时在途的探测任务数上限。</summary>
     private const int MaxConcurrency = 64;
